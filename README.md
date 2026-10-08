@@ -17,3 +17,6 @@ If you have a different version of CUDA, follow the installation instructions fo
 
 ## Documentation
 See the documentation here: https://www.csie.ntu.edu.tw/~cjlin/libmultilabel
+
+![Screenshot](./results.png)
+ 
