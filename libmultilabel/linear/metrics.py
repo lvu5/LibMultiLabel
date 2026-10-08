@@ -114,6 +114,121 @@ class RPrecisionAtK:
         self.num_sample = 0
 
 
+class PropensityScoredPrecisionAtK:
+    r"""Compute normalized propensity-scored precision at k (PSP@k).
+
+    The metric accumulates propensity-weighted hits and divides them by the
+    maximum achievable propensity-weighted hits over the same examples. The
+    normalization is performed over the complete dataset rather than per
+    example. :meth:`compute` returns the normalized score as a fraction,
+    normally in the interval ``[0, 1]``.
+
+    ``label_pos_counts`` and ``N`` must be calculated from the training set.
+    Labels absent from the training set should have a count of zero.
+
+    Args:
+        top_k: Consider only the top k predicted labels for each example.
+        label_pos_counts: One-dimensional vector of nonnegative training-set
+            positive counts, with one entry per label.
+        N: Number of training examples.
+        A: Propensity-model exponent.
+        B: Propensity-model offset.
+    """
+
+    def __init__(
+        self,
+        top_k: int,
+        label_pos_counts: np.ndarray,
+        N: int,
+        A: float = 0.55,
+        B: float = 1.5,
+    ):
+        _check_top_k(top_k)
+
+        try:
+            label_pos_counts = np.asarray(label_pos_counts, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise ValueError("label_pos_counts must be a one-dimensional numeric array") from error
+        if label_pos_counts.ndim != 1:
+            raise ValueError("label_pos_counts must be a one-dimensional array")
+        if not np.all(np.isfinite(label_pos_counts)) or np.any(label_pos_counts < 0):
+            raise ValueError("label_pos_counts must contain finite, nonnegative values")
+        if top_k > label_pos_counts.size:
+            raise ValueError("top_k cannot exceed the number of labels")
+        if not isinstance(N, (int, np.integer)) or isinstance(N, (bool, np.bool_)) or N <= 0:
+            raise ValueError("N must be a positive integer")
+        try:
+            A = float(A)
+            B = float(B)
+        except (TypeError, ValueError) as error:
+            raise ValueError("A and B must be positive finite numbers") from error
+        if not np.isfinite(A) or A <= 0:
+            raise ValueError("A must be a positive finite number")
+        if not np.isfinite(B) or B <= 0:
+            raise ValueError("B must be a positive finite number")
+
+        self.top_k = top_k
+
+        C = (np.log(N) - 1.0) * ((B + 1.0) ** A)
+        self.inv_propensity = 1.0 + C * np.power(label_pos_counts + B, -A)
+        if not np.all(np.isfinite(self.inv_propensity)) or np.any(self.inv_propensity <= 0):
+            raise ValueError("A, B, N, and label_pos_counts produce invalid inverse propensities")
+
+        self.num_sum = 0.0  # sum over rows of weighted hits@K / K
+        self.denom_sum = 0.0  # sum over rows of ideal@K / K
+        self.n_rows = 0
+
+    def update(self, preds: np.ndarray, target: np.ndarray):
+        if preds.ndim != 2 or target.ndim != 2 or preds.shape != target.shape:
+            raise ValueError("preds and target must be two-dimensional arrays with the same shape")
+        if target.shape[1] != self.inv_propensity.size:
+            raise ValueError("target label dimension must equal len(label_pos_counts)")
+
+        return self.update_argsort(_argsort_top_k(preds, self.top_k), target)
+
+    def update_argsort(self, argsort_preds: np.ndarray, target: np.ndarray):
+        K = self.top_k
+        if argsort_preds.ndim != 2 or target.ndim != 2:
+            raise ValueError("argsort_preds and target must be two-dimensional arrays")
+        if argsort_preds.shape[0] != target.shape[0]:
+            raise ValueError("argsort_preds and target must have the same batch size")
+        if argsort_preds.shape[1] < K:
+            raise ValueError("argsort_preds must contain at least top_k indices per example")
+        if target.shape[1] != self.inv_propensity.size:
+            raise ValueError("target label dimension must equal len(label_pos_counts)")
+        if np.any((target != 0) & (target != 1)):
+            raise ValueError("target must be binary")
+
+        topk_idx = argsort_preds[:, -K:]
+        y_topk = np.take_along_axis(target, topk_idx, axis=1).astype(np.float64)
+        invp_topk = self.inv_propensity[topk_idx]
+
+        # Numerator: weighted correct@K
+        num = (y_topk * invp_topk).sum(axis=1) / K  # (B,)
+
+        # Denominator: ideal@K = top-K inv-prop among the true labels
+        # Build per-row inv_prop only on true labels
+        true_mask = target.astype(bool)
+        true_invp = np.where(true_mask, self.inv_propensity, -1.0)
+        topk_true = np.partition(true_invp, -K, axis=1)[:, -K:]
+        topk_true = np.clip(topk_true, 0.0, None)  # ignore -1 (non-trues)
+        denom = topk_true.sum(axis=1) / K  # (B,)
+
+        self.num_sum += num.sum()
+        self.denom_sum += denom.sum()
+        self.n_rows += target.shape[0]
+
+    def compute(self) -> float:
+        if self.n_rows == 0 or self.denom_sum <= 0:
+            return 0.0
+        return float(self.num_sum / self.denom_sum)
+
+    def reset(self):
+        self.num_sum = 0.0
+        self.denom_sum = 0.0
+        self.n_rows = 0
+
+
 class PrecisionAtK:
     """Compute the Precision@K. Please refer to the `implementation document`
     (https://www.csie.ntu.edu.tw/~cjlin/papers/libmultilabel/libmultilabel_implementation.pdf) for details.
@@ -176,6 +291,53 @@ class RecallAtK:
         self.num_sample += argsort_preds.shape[0]
 
     def compute(self) -> float:
+        return self.score / self.num_sample
+
+    def reset(self):
+        self.score = 0
+        self.num_sample = 0
+
+
+class ZeroShotRecallAtK:
+    def __init__(self, top_k: int, unseen_labels):
+        """
+        Args:
+            top_k: Consider only the top k elements for each query.
+        """
+        _check_top_k(top_k)
+
+        self.top_k = top_k
+        self.score = 0
+        self.num_sample = 0
+        self.unseen_labels = unseen_labels
+
+    def update(self, preds: np.ndarray, target: np.ndarray):
+        assert preds.shape == target.shape  # (batch_size, num_classes)
+        return self.update_argsort(np.argpartition(preds, -self.top_k), target)
+
+    def update_argsort(self, argsort_preds: np.ndarray, target: np.ndarray):
+        top_k_idx = argsort_preds[:, -self.top_k :]  # top k indices
+        is_unseen_top_k = np.isin(top_k_idx, self.unseen_labels)  # return a true false array
+        # marking the unseen labels in top k
+        num_relevant = (
+            np.logical_and(np.take_along_axis(target, top_k_idx, -1), is_unseen_top_k).sum(axis=-1).astype(np.float64)
+        )
+
+        # not taking instances with no zero shot labels into account
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self.score += np.nansum(num_relevant / target[:, self.unseen_labels].sum(axis=-1))
+        self.num_sample += np.count_nonzero(target[:, self.unseen_labels].sum(axis=-1))
+
+        # by convention, recall is 0 for zero label instances
+        # with np.errstate(divide='ignore', invalid='ignore'):
+        #     self.score += np.nan_to_num(
+        #         num_relevant / target[:,self.unseen_labels].sum(axis=-1),
+        #         nan=0.0
+        #     ).sum()
+        # self.num_sample += argsort_preds.shape[0]
+
+    def compute(self) -> float:
+        # print(f"There are {self.num_sample} samples with zero-shot labels.")
         return self.score / self.num_sample
 
     def reset(self):
@@ -284,7 +446,17 @@ class MetricCollection(dict):
             metric.reset()
 
 
-def get_metrics(monitor_metrics: list[str], num_classes: int, multiclass: bool = False) -> MetricCollection:
+def get_metrics(
+    monitor_metrics: list[str],
+    num_classes: int,
+    multiclass: bool = False,
+    *,
+    unseen_labels=None,
+    label_pos_counts=None,
+    num_instances=None,
+    propensity_a: float = 0.55,
+    propensity_b: float = 1.5,
+) -> MetricCollection:
     """Get a collection of metrics by their names.
     See MetricCollection for more details.
 
@@ -292,6 +464,14 @@ def get_metrics(monitor_metrics: list[str], num_classes: int, multiclass: bool =
         monitor_metrics (list[str]): A list of metric names.
         num_classes (int): The number of classes.
         multiclass (bool, optional): Enable multiclass mode. Defaults to False.
+        unseen_labels: Indices of labels absent from the training set, used by
+            zero-shot recall metrics.
+        label_pos_counts: One-dimensional vector of nonnegative positive
+            counts calculated from the training labels, used by PSP metrics.
+        num_instances: Number of training examples used to calculate
+            ``label_pos_counts``.
+        propensity_a: Propensity-model exponent used by PSP metrics.
+        propensity_b: Propensity-model offset used by PSP metrics.
 
     Returns:
         MetricCollection: A metric collection of the list of metrics.
@@ -304,10 +484,24 @@ def get_metrics(monitor_metrics: list[str], num_classes: int, multiclass: bool =
             metrics[metric] = PrecisionAtK(top_k=int(metric[2:]))
         elif re.match(r"R@\d+", metric):
             metrics[metric] = RecallAtK(top_k=int(metric[2:]))
+        elif re.match(r"ZSR@\d+", metric):
+            metrics[metric] = ZeroShotRecallAtK(top_k=int(metric[4:]), unseen_labels=unseen_labels)
         elif re.match(r"RP@\d+", metric):
             metrics[metric] = RPrecisionAtK(top_k=int(metric[3:]))
         elif re.match(r"NDCG@\d+", metric):
             metrics[metric] = NDCGAtK(top_k=int(metric[5:]))
+        elif re.match(r"PSP@\d+", metric):
+            if label_pos_counts is None:
+                raise ValueError("label_pos_counts is required for PSP metrics")
+            if np.asarray(label_pos_counts).shape != (num_classes,):
+                raise ValueError("len(label_pos_counts) must equal num_classes")
+            metrics[metric] = PropensityScoredPrecisionAtK(
+                top_k=int(metric[4:]),
+                label_pos_counts=label_pos_counts,
+                N=num_instances,
+                A=propensity_a,
+                B=propensity_b,
+            )
         elif metric in {"Another-Macro-F1", "Macro-F1", "Micro-F1"}:
             metrics[metric] = F1(num_classes, average=metric[:-3].lower(), multiclass=multiclass)
         else:
@@ -317,7 +511,16 @@ def get_metrics(monitor_metrics: list[str], num_classes: int, multiclass: bool =
 
 
 def compute_metrics(
-    preds: np.ndarray, target: np.ndarray, monitor_metrics: list[str], multiclass: bool = False
+    preds: np.ndarray,
+    target: np.ndarray,
+    monitor_metrics: list[str],
+    multiclass: bool = False,
+    *,
+    unseen_labels=None,
+    label_pos_counts=None,
+    num_instances=None,
+    propensity_a: float = 0.55,
+    propensity_b: float = 1.5,
 ) -> dict[str, float]:
     """Compute metrics with decision values and labels.
     See get_metrics and MetricCollection if decision values and labels are too
@@ -329,13 +532,30 @@ def compute_metrics(
         target (np.ndarray): A 0/1 matrix of labels with dimensions number of instances * number of classes.
         monitor_metrics (list[str]): A list of metric names.
         multiclass (bool, optional): Enable multiclass mode. Defaults to False.
+        unseen_labels: Indices of labels absent from the training set, used by
+            zero-shot recall metrics.
+        label_pos_counts: One-dimensional vector of nonnegative positive
+            counts calculated from the training labels, used by PSP metrics.
+        num_instances: Number of training examples used to calculate
+            ``label_pos_counts``.
+        propensity_a: Propensity-model exponent used by PSP metrics.
+        propensity_b: Propensity-model offset used by PSP metrics.
 
     Returns:
         dict[str, float]: A dictionary of metric values.
     """
     assert preds.shape == target.shape
 
-    metric = get_metrics(monitor_metrics, preds.shape[1], multiclass)
+    metric = get_metrics(
+        monitor_metrics,
+        preds.shape[1],
+        multiclass=multiclass,
+        unseen_labels=unseen_labels,
+        label_pos_counts=label_pos_counts,
+        num_instances=num_instances,
+        propensity_a=propensity_a,
+        propensity_b=propensity_b,
+    )
     metric.update(preds, target)
     return metric.compute()
 
@@ -351,11 +571,11 @@ def tabulate_metrics(metric_dict: dict[str, float], split: str) -> str:
         str: Pretty formatted string.
     """
     msg = f"====== {split} dataset evaluation result =======\n"
-    header = "|".join([f"{k:^18}" for k in metric_dict.keys()])
+    header = "|".join([f"{k:^10}" for k in metric_dict.keys()])
     values = "|".join(
-        [f"{x:^18.4f}" if isinstance(x, (np.floating, float)) else f"{x:^18}" for x in metric_dict.values()]
+        [f"{x*100:^10.2f}" if isinstance(x, (np.floating, float)) else f"{x*100:^10}" for x in metric_dict.values()]
     )
-    msg += f"|{header}|\n|{'-----------------:|' * len(metric_dict)}\n|{values}|\n"
+    msg += f"|{header}|\n|{'---------:|' * len(metric_dict)}\n|{values}|\n"
     return msg
 
 

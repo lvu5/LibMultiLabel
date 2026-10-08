@@ -167,7 +167,7 @@ def add_all_arguments(parser):
     parser.add_argument(
         "--monitor_metrics",
         nargs="+",
-        default=["P@1", "P@3", "P@5"],
+        default=["P@1", "P@3", "P@5", "R@1", "R@3", "R@5", "NDCG@1", "NDCG@3", "NDCG@5", "PSP@1", "PSP@3", "PSP@5"],
         help="Metrics to monitor for evaluation (default: %(default)s)",
     )
     parser.add_argument(

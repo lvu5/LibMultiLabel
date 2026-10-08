@@ -61,7 +61,7 @@ class FlatModel:
             x = sparse.hstack(
                 [
                     x,
-                    np.zeros((x.shape[0], num_feature - x.shape[1])),
+                    sparse.csr_matrix((x.shape[0], num_feature - x.shape[1])),
                     bias_col,
                 ],
                 "csr",
@@ -75,7 +75,13 @@ class FlatModel:
                 "csr",
             )
 
-        return self._to_dense_array(x * self.weights) + self.thresholds
+        # CSC column views share the tree's weight buffers. This orientation
+        # avoids converting a whole weight block to CSR on every input batch.
+        if sparse.isspmatrix_csc(self.weights):
+            values = (self.weights.T @ x.T).T
+        else:
+            values = x * self.weights
+        return self._to_dense_array(values) + self.thresholds
 
     def _to_dense_array(self, matrix: np.matrix | sparse.csr_matrix) -> np.ndarray:
         """Convert a numpy or scipy matrix to a dense ndarray.
@@ -100,9 +106,12 @@ class ParallelOVRTrainer(threading.Thread):
     bias: float
     prob: problem
     param: parameter
-    weights: np.ndarray
+    weights: np.ndarray | list[sparse.csc_matrix]
     pbar: tqdm
     queue: queue.SimpleQueue
+    errors: queue.SimpleQueue
+    sparse_output: bool
+    num_threads: int
 
     def __init__(self):
         threading.Thread.__init__(self)
@@ -114,6 +123,7 @@ class ParallelOVRTrainer(threading.Thread):
         x: sparse.csr_matrix,
         options: str,
         verbose: bool,
+        sparse_output: bool = False,
     ):
         """Initialize the parallel trainer by setting y, x, parameter and threading related
         variables as class variables of ParallelOVRTrainer.
@@ -123,8 +133,12 @@ class ParallelOVRTrainer(threading.Thread):
             x (sparse.csr_matrix): A matrix with dimensions number of instances * number of features.
             options (str): The option string passed to liblinear.
             verbose (bool): Output extra progress information.
+            sparse_output (bool): Collect sparse columns instead of dense weights.
         """
         x, options, bias = _prepare_options(x, options)
+        requested_threads = int(options.split()[options.split().index("-m") + 1])
+        if requested_threads < 1:
+            raise ValueError("-m must specify at least one training thread.")
         cls.y = y.tocsc()
         cls.x = x
         cls.bias = bias
@@ -136,8 +150,11 @@ class ParallelOVRTrainer(threading.Thread):
         cls.param = parameter(re.sub(r"-m\s+\d+", "", options))
         if cls.param.solver_type in [solver_names.L2R_L1LOSS_SVC_DUAL, solver_names.L2R_L2LOSS_SVC_DUAL]:
             cls.param.w_recalc = True  # only works for solving L1/L2-SVM dual
-        cls.weights = np.zeros((num_features, num_classes), order="F")
+        cls.num_threads = min(requested_threads, num_classes)
+        cls.sparse_output = sparse_output
+        cls.weights = [None] * num_classes if sparse_output else np.zeros((num_features, num_classes), order="F")
         cls.queue = queue.SimpleQueue()
+        cls.errors = queue.SimpleQueue()
 
         if verbose:
             logging.info(f"Training a one-vs-rest model on {num_classes} labels")
@@ -164,7 +181,10 @@ class ParallelOVRTrainer(threading.Thread):
             return np.matrix(np.zeros((self.prob.n, 1)))
 
         prob = self.prob.copy()
-        prob.y = (c_double * prob.l)(*y)
+        # Expanding *y materializes one Python object per instance in every
+        # worker. Fill the owned C buffer directly instead.
+        prob.y = (c_double * prob.l)()
+        np.ctypeslib.as_array(prob.y, (prob.l,))[:] = y
         model = train(prob, self.param)
 
         w = np.ctypeslib.as_array(model.w, (self.prob.n, 1))
@@ -181,13 +201,24 @@ class ParallelOVRTrainer(threading.Thread):
             return w.copy()
 
     def run(self):
-        while True:
+        while self.errors.empty():
             try:
                 label_idx = self.queue.get_nowait()
             except queue.Empty:
                 break
-            yi = self.y[:, label_idx].toarray().reshape(-1)
-            self.weights[:, label_idx] = self._do_parallel_train(2 * yi - 1).ravel()
+            try:
+                yi = self.y[:, label_idx].toarray().reshape(-1).astype(np.float64, copy=False)
+                yi *= 2
+                yi -= 1
+                weights = self._do_parallel_train(yi)
+                if self.sparse_output:
+                    self.weights[label_idx] = sparse.csc_matrix(weights)
+                else:
+                    self.weights[:, label_idx] = weights.ravel()
+                del weights, yi
+            except Exception as exc:
+                self.errors.put(exc)
+                break
 
             self.pbar.update()
 
@@ -198,8 +229,13 @@ def train_1vsrest(
     multiclass: bool = False,
     options: str = "",
     verbose: bool = True,
+    sparse_output: bool = False,
 ) -> FlatModel:
     """Train a linear model parallel on labels for multi-label data using a one-vs-rest strategy.
+
+    The -m option controls concurrent label workers (default: at most 8).
+    Set sparse_output=True to collect sparse columns instead of a dense
+    features-by-labels weight matrix, as used when training tree nodes.
 
     Args:
         y (sparse.csr_matrix): A 0/1 matrix with dimensions number of instances * number of classes.
@@ -207,24 +243,44 @@ def train_1vsrest(
         multiclass (bool, optional): A flag indicating if the dataset is multiclass.
         options (str, optional): The option string passed to liblinear. Defaults to ''.
         verbose (bool, optional): Output extra progress information. Defaults to True.
+        sparse_output (bool, optional): Return CSC weights without allocating a dense
+            matrix for all labels. Defaults to False.
 
     Returns:
         A model which can be used in predict_values.
     """
     # Follows the MATLAB implementation at https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/multilabel/
-    ParallelOVRTrainer.init_trainer(y, x, options, verbose)
-    num_threads = psutil.cpu_count(logical=False)
-    trainers = [ParallelOVRTrainer() for _ in range(num_threads)]
-    for trainer in trainers:
-        trainer.start()
-    for trainer in trainers:
-        trainer.join()
-    weights, bias = ParallelOVRTrainer.weights, ParallelOVRTrainer.bias
-    ParallelOVRTrainer.del_trainer()
+    # More simultaneous solvers multiply per-instance and per-feature workspaces.
+    # An explicit -m still overrides this memory-oriented default.
+    if "-m" not in (options or "").split():
+        options = f"{options or ''} -m {min(8, psutil.cpu_count(logical=False) or 1)}"
+    ParallelOVRTrainer.init_trainer(y, x, options, verbose, sparse_output)
+    trainers = [ParallelOVRTrainer() for _ in range(ParallelOVRTrainer.num_threads)]
+    started = []
+    try:
+        for trainer in trainers:
+            trainer.start()
+            started.append(trainer)
+        for trainer in started:
+            trainer.join()
+        if not ParallelOVRTrainer.errors.empty():
+            raise ParallelOVRTrainer.errors.get()
+        weights, bias = ParallelOVRTrainer.weights, ParallelOVRTrainer.bias
+        if sparse_output:
+            weights = (
+                sparse.hstack(weights, format="csc")
+                if weights else sparse.csc_matrix((ParallelOVRTrainer.x.shape[1], 0))
+            )
+        else:
+            weights = np.asmatrix(weights)
+    finally:
+        for trainer in started:
+            trainer.join()
+        ParallelOVRTrainer.del_trainer()
 
     return FlatModel(
         name="1vsrest",
-        weights=np.asmatrix(weights),
+        weights=weights,
         bias=bias,
         thresholds=0,
         multiclass=multiclass,
