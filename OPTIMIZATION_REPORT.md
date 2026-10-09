@@ -1,7 +1,7 @@
 # Tree-model optimization report: Original → v1 → v2
 
 LibMultiLabel linear tree model (`--linear --linear_technique tree`), evaluated on
-EURLEX-4K, EURLEX-57K and AmazonCat-13K (zero-shot splits).
+EURLEX-4K, EURLEX-57K, AmazonCat-13K and LF-Amazon-131K (zero-shot splits).
 
 | Version | Directory |
 | --- | --- |
@@ -22,15 +22,25 @@ lifetime peak RSS. All runs use `-m 8`.
 | EURLEX-57K peak | 14644.3 MiB | 13181.4 MiB | **7641.6 MiB** | −47.8% |
 | AmazonCat-13K time | 3440.90 s | 2727.66 s | **1252.41 s** | −63.6% |
 | AmazonCat-13K peak | 20851.4 MiB | 18284.7 MiB | **8146.3 MiB** | −60.9% |
+| LF-Amazon-131K time | 9083.76 s | 6852.05 s | **2446.34 s** | −73.1% |
+| LF-Amazon-131K peak | 16870.0 MiB | 13223.8 MiB | **7719.3 MiB** | −54.2% |
 
-All 12 metrics (P/R/NDCG/PSP@1,3,5) of every version agree within ±0.10
-percentage points for v1 and ±0.02 for v2. On AmazonCat they match to two
-decimals, except PSP@5 (70.61 vs 70.60).
+On EURLEX-4K, EURLEX-57K and AmazonCat-13K, all 12 metrics (P/R/NDCG/PSP@1,3,5)
+agree with the original within ±0.10 percentage points for v1 and ±0.02 for v2.
+On AmazonCat they match to two decimals, except PSP@5 (70.61 vs 70.60).
+
+On LF-Amazon-131K, v1 and v2 agree within ±0.01. Both score 0.03–0.09 points
+above the original on every metric (P@1: 32.95 original, 33.01 v1, 33.00 v2).
+This consistent shift is not random variation, and it does not come from v2,
+which matches v1. It is most likely due to v1 limiting k-means to 8 threads,
+whereas the original clustering library defaults to half the CPU count (48 here).
+That can change the label tree, which on LF-Amazon-131K has about 33,000 nodes.
 
 ## 2. Run settings: identical for all versions
 
-- **Scripts:** `run_eurlex4k_zs.sh`, `run_eurlex57k_zs.sh` and
-  `run_amazoncat13k_zs.sh` are byte-identical in the three directories.
+- **Scripts:** `run_eurlex4k_zs.sh`, `run_eurlex57k_zs.sh`,
+  `run_amazoncat13k_zs.sh` and `run_lf_amazon131k_zs.sh` are byte-identical in
+  the three directories.
 - **Command line:** every log records the same arguments:
   `main.py --model_name tree --linear --linear_technique tree --data_format svm --seed 42 --liblinear_options "-m 8"`,
   with the same Python environment (`miniconda3/envs/libmultilabel`).
@@ -187,4 +197,4 @@ All 31 tests pass.
 - **EURLEX-57K slowdown:** on this dataset, two clustering iterations
   occasionally take about 130 s instead of about 8 s. This happened once in
   each version and does not come from this code. A same-day v1 re-run hit it
-  (572 s instead of 327 s), so the tables use your original v1 measurement.
+  (572 s instead of 327 s), so the tables use the earlier v1 measurement.
