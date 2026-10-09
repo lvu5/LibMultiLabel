@@ -53,6 +53,25 @@ class FlatModel:
         Returns:
             np.ndarray: A matrix with dimension number of instances * number of classes.
         """
+        x = self.prepare_instances(x)
+
+        # CSC column views share the tree's weight buffers. This orientation
+        # avoids converting a whole weight block to CSR on every input batch.
+        if sparse.isspmatrix_csc(self.weights):
+            values = (self.weights.T @ x.T).T
+        else:
+            values = x * self.weights
+        return self._to_dense_array(values) + self.thresholds
+
+    def prepare_instances(self, x: sparse.csr_matrix) -> sparse.csr_matrix:
+        """Match x to the rows of the weights: truncate or pad features, then append the bias column.
+
+        Args:
+            x (sparse.csr_matrix): A matrix with dimension number of instances * number of features.
+
+        Returns:
+            sparse.csr_matrix: A matrix with dimension number of instances * number of weight rows.
+        """
         bias = self.bias
         bias_col = np.full((x.shape[0], 1 if bias > 0 else 0), bias)
         num_feature = self.weights.shape[0]
@@ -74,14 +93,7 @@ class FlatModel:
                 ],
                 "csr",
             )
-
-        # CSC column views share the tree's weight buffers. This orientation
-        # avoids converting a whole weight block to CSR on every input batch.
-        if sparse.isspmatrix_csc(self.weights):
-            values = (self.weights.T @ x.T).T
-        else:
-            values = x * self.weights
-        return self._to_dense_array(values) + self.thresholds
+        return x
 
     def _to_dense_array(self, matrix: np.matrix | sparse.csr_matrix) -> np.ndarray:
         """Convert a numpy or scipy matrix to a dense ndarray.
@@ -96,6 +108,50 @@ class FlatModel:
             return matrix.toarray()
         elif isinstance(matrix, np.matrix):
             return np.asarray(matrix)
+
+
+def _signed_label(y: sparse.csc_matrix, label_idx: int) -> np.ndarray:
+    """Column label_idx of a 0/1 matrix as a +1/-1 vector."""
+    yi = y[:, label_idx].toarray().reshape(-1).astype(np.float64, copy=False)
+    yi *= 2
+    yi -= 1
+    return yi
+
+
+def _train_label(prob: problem, param: parameter, y: np.ndarray) -> np.matrix:
+    """Wrap around liblinear.liblinearutil.train.
+
+    Args:
+        prob (problem): The training instances; the labels are replaced by y.
+        param (parameter): LIBLINEAR parameters.
+        y (np.ndarray): A +1/-1 array with dimensions number of instances * 1.
+
+    Returns:
+        np.matrix: The weights.
+    """
+    if y.shape[0] == 0:
+        return np.matrix(np.zeros((prob.n, 1)))
+
+    n = prob.n
+    prob = prob.copy()
+    # Expanding *y materializes one Python object per instance in every
+    # worker. Fill the owned C buffer directly instead.
+    prob.y = (c_double * prob.l)()
+    np.ctypeslib.as_array(prob.y, (prob.l,))[:] = y
+    model = train(prob, param)
+
+    w = np.ctypeslib.as_array(model.w, (n, 1))
+    w = np.asmatrix(w)
+    # When all labels are -1, we must flip the sign of the weights
+    # because LIBLINEAR treats the first label as positive, which
+    # is -1 in this case. But for our usage we need them to be negative.
+    # For data with both +1 and -1 for labels, LIBLINEAR guarantees
+    # that +1 is always the first label.
+    if model.get_labels()[0] == -1:
+        return -w
+    else:
+        # The memory is freed on model deletion so we make a copy.
+        return w.copy()
 
 
 class ParallelOVRTrainer(threading.Thread):
@@ -177,28 +233,7 @@ class ParallelOVRTrainer(threading.Thread):
         Returns:
             np.matrix: The weights.
         """
-        if y.shape[0] == 0:
-            return np.matrix(np.zeros((self.prob.n, 1)))
-
-        prob = self.prob.copy()
-        # Expanding *y materializes one Python object per instance in every
-        # worker. Fill the owned C buffer directly instead.
-        prob.y = (c_double * prob.l)()
-        np.ctypeslib.as_array(prob.y, (prob.l,))[:] = y
-        model = train(prob, self.param)
-
-        w = np.ctypeslib.as_array(model.w, (self.prob.n, 1))
-        w = np.asmatrix(w)
-        # When all labels are -1, we must flip the sign of the weights
-        # because LIBLINEAR treats the first label as positive, which
-        # is -1 in this case. But for our usage we need them to be negative.
-        # For data with both +1 and -1 for labels, LIBLINEAR guarantees
-        # that +1 is always the first label.
-        if model.get_labels()[0] == -1:
-            return -w
-        else:
-            # The memory is freed on model deletion so we make a copy.
-            return w.copy()
+        return _train_label(self.prob, self.param, y)
 
     def run(self):
         while self.errors.empty():
@@ -207,9 +242,7 @@ class ParallelOVRTrainer(threading.Thread):
             except queue.Empty:
                 break
             try:
-                yi = self.y[:, label_idx].toarray().reshape(-1).astype(np.float64, copy=False)
-                yi *= 2
-                yi -= 1
+                yi = _signed_label(self.y, label_idx)
                 weights = self._do_parallel_train(yi)
                 if self.sparse_output:
                     self.weights[label_idx] = sparse.csc_matrix(weights)

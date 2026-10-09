@@ -1,24 +1,49 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import psutil
 
 __all__ = ["get_metrics", "compute_metrics", "tabulate_metrics", "MetricCollection"]
 
+# Selections over at least this many elements are split into row blocks.
+_PARALLEL_SELECT_MIN_SIZE = 1 << 20
+_select_executor = None
+
+
+def _select_last_columns(select, array: np.ndarray, kth: int, count: int) -> np.ndarray:
+    """``select(array, kth, axis=-1)[:, -count:]`` for np.partition or np.argpartition.
+
+    Both treat every row on its own and release the GIL, so row blocks are
+    selected in parallel threads with the same result as a single call.
+    """
+    global _select_executor
+    num_threads = min(8, psutil.cpu_count(logical=False) or 1)
+    if array.ndim != 2 or num_threads < 2 or array.size < _PARALLEL_SELECT_MIN_SIZE:
+        return select(array, kth, axis=-1)[:, -count:]
+    if _select_executor is None:
+        _select_executor = ThreadPoolExecutor(num_threads, thread_name_prefix="libmultilabel-metrics")
+    bounds = np.linspace(0, array.shape[0], num_threads + 1).astype(np.int64)
+    blocks = _select_executor.map(
+        lambda rows: select(array[rows[0] : rows[1]], kth, axis=-1)[:, -count:], zip(bounds[:-1], bounds[1:])
+    )
+    return np.concatenate(list(blocks))
+
 
 def _argsort_top_k(preds: np.ndarray, top_k: int) -> np.ndarray:
-    """Sort the top k indices in O(n + k log k) time.
+    """Sorts the top k indices in O(n + k log k) time.
     The sorting order is ascending to be consistent with np.sort.
     This means the last element is the largest, the first element is the kth largest.
     """
-    top_k_idx = np.argpartition(preds, -top_k)[:, -top_k:]
+    top_k_idx = _select_last_columns(np.argpartition, preds, -top_k, top_k)
     argsort_top_k = np.argsort(np.take_along_axis(preds, top_k_idx, axis=-1))
     return np.take_along_axis(top_k_idx, argsort_top_k, axis=-1)
 
 
 def _dcg_argsort(argsort_preds: np.ndarray, target: np.ndarray, top_k: int) -> np.ndarray:
-    """Compute DCG@k with a sorted preds array and a target array."""
+    """Computes DCG@k with a sorted preds array and a target array."""
     top_k_idx = argsort_preds[:, -top_k:][:, ::-1]
     gains = np.take_along_axis(target, top_k_idx, axis=-1)
     discount = 1 / (np.log2(np.arange(top_k) + 2))
@@ -28,7 +53,7 @@ def _dcg_argsort(argsort_preds: np.ndarray, target: np.ndarray, top_k: int) -> n
 
 
 def _idcg(target: np.ndarray, top_k: int) -> np.ndarray:
-    """Compute IDCG@k for a 0/1 target array. A 0/1 target is a special case that
+    """Computes IDCG@k for a 0/1 target array. A 0/1 target is a special case that
     doesn't require sorting. If IDCG is computed with DCG,
     then target will need to be sorted, which incurs a large overhead.
     """
@@ -210,7 +235,7 @@ class PropensityScoredPrecisionAtK:
         # Build per-row inv_prop only on true labels
         true_mask = target.astype(bool)
         true_invp = np.where(true_mask, self.inv_propensity, -1.0)
-        topk_true = np.partition(true_invp, -K, axis=1)[:, -K:]
+        topk_true = _select_last_columns(np.partition, true_invp, -K, K)
         topk_true = np.clip(topk_true, 0.0, None)  # ignore -1 (non-trues)
         denom = topk_true.sum(axis=1) / K  # (B,)
 
@@ -409,7 +434,7 @@ class MetricCollection(dict):
         self.max_k = max(getattr(metric, "top_k", 0) for metric in self.metrics.values())
 
     def update(self, preds: np.ndarray, target: np.ndarray):
-        """Add a batch of decision values and labels.
+        """Adds a batch of decision values and labels.
 
         Args:
             preds (np.ndarray): A matrix of decision values with dimensions number of instances * number of classes.
@@ -430,7 +455,7 @@ class MetricCollection(dict):
                 metric.update(preds, target)
 
     def compute(self) -> dict[str, float]:
-        """Compute the metrics from the accumulated batches of decision values and labels.
+        """Computes the metrics from the accumulated batches of decision values and labels.
 
         Returns:
             dict[str, float]: A dictionary of metric values.
@@ -441,7 +466,7 @@ class MetricCollection(dict):
         return ret
 
     def reset(self):
-        """Clear the accumulated batches of decision values and labels."""
+        """Clears the accumulated batches of decision values and labels."""
         for metric in self.metrics.values():
             metric.reset()
 
