@@ -117,17 +117,25 @@ class TrainingMemoryTests(unittest.TestCase):
         model = tree.TreeModel(root, *tree._flatten_model(root))
         x = sparse.csr_matrix(np.random.default_rng(8).normal(size=(7, 4)))
         flat_weights = model.flat_model.weights
+        arrays = [flat_weights.data.copy(), flat_weights.indices.copy(), flat_weights.indptr.copy()]
         self.assertFalse(model._model_separated)
+        batches = (x[:3], x[3:])
+        expected = {
+            (beam, i): np.vstack([model._beam_search(row, beam, 3) for row in model.flat_model.predict_values(batch)])
+            for beam in (1, 4) for i, batch in enumerate(batches)
+        }
         with patch.object(model, "_separate_model_for_pruning_tree", wraps=model._separate_model_for_pruning_tree) as build:
             for beam in (1, 4, 1):
-                for batch in (x[:3], x[3:]):
-                    full = model.flat_model.predict_values(batch)
-                    expected = np.vstack([model._beam_search(row, beam, 3) for row in full])
-                    assert_allclose(model.predict_values(batch, beam), expected, rtol=1e-12)
+                for i, batch in enumerate(batches):
+                    assert_array_equal(model.predict_values(batch, beam), expected[beam, i])
             self.assertEqual(build.call_count, 1)
-        self.assertIs(model.flat_model.weights, flat_weights)
         for block in [model.root_model, *model.subtree_models]:
             self.assertTrue(sparse.isspmatrix_csr(block.weights))
+        # The CSR blocks overwrite the flattened weights; accessing them restores the CSC arrays.
+        self.assertIs(model.flat_model.weights, flat_weights)
+        self.assertFalse(model._model_separated)
+        for actual, original in zip((flat_weights.data, flat_weights.indices, flat_weights.indptr), arrays):
+            assert_array_equal(actual, original)
 
     def test_csr_cache_handles_int64_source_indices(self):
         root, _ = make_tree()

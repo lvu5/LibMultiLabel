@@ -108,26 +108,33 @@ class TreeMemoryTests(unittest.TestCase):
             del node.model
         refs = []
         visited = []
-        original_load = np.load
+        original_read = tree._read_staged
 
         def train_node(node):
             self.assertTrue(all(ref() is None for ref in refs))
             visited.append(node)
             columns = len(node.label_map) if node.isLeaf() else len(node.children)
+            # int64 indices are converted to the final int32 in bounded chunks.
             weights = sparse.csc_matrix(np.ones((5, columns)))
+            weights.indices = weights.indices.astype(np.int64)
+            weights.indptr = weights.indptr.astype(np.int64)
             refs.extend(weakref.ref(array) for array in (weights.data, weights.indices, weights.indptr))
             node.model = linear.FlatModel("node", weights, 1, 0, False)
 
-        def load_chunk(*args, **kwargs):
+        chunk_sizes = []
+
+        def read_staged(file, out, dtype):
             self.assertEqual(visited, nodes)
             self.assertTrue(all(ref() is None for ref in refs))
-            chunk = original_load(*args, **kwargs)
-            self.assertLessEqual(chunk.size, 2)
-            return chunk
+            if out.dtype != dtype:
+                chunk_sizes.append(min(out.size, tree._WEIGHT_CHUNK_SIZE))
+            return original_read(file, out, dtype)
 
-        with patch.object(tree, "_WEIGHT_CHUNK_SIZE", 2), patch.object(tree.np, "load", side_effect=load_chunk):
+        with patch.object(tree, "_WEIGHT_CHUNK_SIZE", 2), patch.object(tree, "_read_staged", side_effect=read_staged):
             flat, _ = tree._flatten_model(root, train_node)
         assert_array_equal(flat.weights.toarray(), np.ones((5, 8)))
+        self.assertTrue(chunk_sizes)
+        self.assertLessEqual(max(chunk_sizes), 2)
 
     def test_final_csc_reuses_allocated_buffers(self):
         root, _ = make_tree()
@@ -147,6 +154,31 @@ class TreeMemoryTests(unittest.TestCase):
         self.assertEqual(checked, [True])
 
     def test_temporary_file_closes_on_success_and_failure(self):
+        class FailingFile:
+            """A staging file whose writes or reads fail."""
+
+            def __init__(self, file, failure):
+                self.file, self.failure = file, failure
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.file.close()
+
+            def write(self, data):
+                if self.failure == "write":
+                    raise OSError("disk failure")
+                return self.file.write(data)
+
+            def readinto(self, buffer):
+                if self.failure == "read":
+                    raise OSError("disk failure")
+                return self.file.readinto(buffer)
+
+            def seek(self, *args):
+                return self.file.seek(*args)
+
         for failure in (None, "train", "write", "read"):
             with self.subTest(failure=failure):
                 root, _ = make_tree()
@@ -156,12 +188,10 @@ class TreeMemoryTests(unittest.TestCase):
                     if failure == "train" and node is not root:
                         raise RuntimeError("training interrupted")
 
-                with patch.object(tree.tempfile, "TemporaryFile", return_value=staging_file):
+                with patch.object(tree.tempfile, "TemporaryFile", return_value=FailingFile(staging_file, failure)):
                     if failure in ("write", "read"):
-                        operation = "save" if failure == "write" else "load"
-                        with patch.object(tree.np, operation, side_effect=OSError("disk failure")):
-                            with self.assertRaisesRegex(OSError, "disk failure"):
-                                tree._flatten_model(root, train_node)
+                        with self.assertRaisesRegex(OSError, "disk failure"):
+                            tree._flatten_model(root, train_node)
                     elif failure == "train":
                         with self.assertRaisesRegex(RuntimeError, "training interrupted"):
                             tree._flatten_model(root, train_node)
@@ -182,8 +212,12 @@ class TreeMemoryTests(unittest.TestCase):
         for node in nodes:
             del node.model
 
-        def old_assembly(root, train_node):
-            root.dfs(train_node)
+        def old_assembly(root, train_node=None, trained_nodes=None):
+            if trained_nodes is None:
+                root.dfs(train_node)
+            else:
+                for _ in trained_nodes:
+                    pass
             return reference_flatten(root)
 
         # A primal solver avoids differences from LIBLINEAR's random dual updates.

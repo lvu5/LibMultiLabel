@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import codecs
 import csv
+import io
+import locale
 import logging
+import multiprocessing
+import os
 import re
+import sys
 from array import array
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import psutil
 import scipy.sparse as sparse
 
 __all__ = ["load_dataset"]
@@ -38,22 +45,32 @@ def _read_libmultilabel_format(data: str | pd.Dataframe) -> dict[str, list[str]]
     return data.to_dict("list")
 
 
-def _read_libsvm_format(file_path: str) -> dict[str, list[list[int]] | sparse.csr_matrix]:
-    """Read multi-label LIBSVM-format data.
+class _SvmFormatError(Exception):
+    """An invalid line, identified by its index among the parsed lines."""
 
-    Args:
-        file_path (str): Path to file.
+    def __init__(self, line_index: int, invalid_index: bool):
+        super().__init__(line_index)
+        self.line_index = line_index
+        self.invalid_index = invalid_index
 
-    Returns:
-        tuple[list[list[int]], sparse.csr_matrix]: A tuple of labels and features.
-    """
+    def to_public(self, first_line: int, file_path: str) -> Exception:
+        line = first_line + self.line_index + 1
+        if self.invalid_index:
+            return IndexError(
+                f"invalid svm format at line {line} of the file '{file_path}' --> Indices should start from one."
+            )
+        return ValueError(f"invalid svm format at line {line} of the file '{file_path}'")
+
+
+def _parse_libsvm_lines(lines) -> tuple[list[list[int]], array, array, array]:
+    """Parse lines of LIBSVM-format data into labels, values, column indices and row sizes."""
     prob_y = []
     prob_x = array("d")
-    row_ptr = array("l", [0])
+    row_nnz = array("l")
     col_idx = array("l")
 
     pattern = re.compile(r"(?!^$)([+\-0-9,]+\s+)?(.*\n?)")
-    for i, line in enumerate(open(file_path)):
+    for i, line in enumerate(lines):
         m = pattern.fullmatch(line)
         try:
             labels = m[1]
@@ -65,22 +82,102 @@ def _read_libsvm_format(file_path: str) -> dict[str, list[list[int]] | sparse.cs
                 idx, val = e.split(":")
                 idx, val = int(idx), float(val)
                 if idx < 1:
-                    raise IndexError(
-                        f"invalid svm format at line {i + 1} of the file '{file_path}' --> Indices should start from one."
-                    )
+                    raise _SvmFormatError(i, invalid_index=True)
                 if val != 0:
                     col_idx.append(idx - 1)
                     prob_x.append(val)
                     nz += 1
-            row_ptr.append(row_ptr[-1] + nz)
-        except IndexError:
+            row_nnz.append(nz)
+        except _SvmFormatError:
             raise
         except:
-            raise ValueError(f"invalid svm format at line {i + 1} of the file '{file_path}'")
+            raise _SvmFormatError(i, invalid_index=False)
+    return prob_y, prob_x, col_idx, row_nnz
 
-    prob_x = np.frombuffer(prob_x, dtype="d")
+
+# Files at least this large are parsed by worker processes, in chunks of whole lines.
+_PARALLEL_READ_MIN_BYTES = 64 * 1024**2
+_READ_CHUNK_BYTES = 16 * 1024**2
+
+
+def _parse_libsvm_chunk(task):
+    """Parse the lines in a byte range of a file as open(file_path) would read them."""
+    file_path, start, stop, encoding = task
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        lines = io.TextIOWrapper(io.BytesIO(f.read(stop - start)), encoding=encoding)
+    try:
+        prob_y, prob_x, col_idx, row_nnz = _parse_libsvm_lines(lines)
+    except _SvmFormatError as error:
+        # A plain tuple: exceptions with extra constructor arguments do not unpickle.
+        return error.line_index, error.invalid_index
     col_idx = np.frombuffer(col_idx, dtype="l")
-    row_ptr = np.frombuffer(row_ptr, dtype="l")
+    if col_idx.size == 0 or col_idx.max() <= np.iinfo(np.int32).max:
+        col_idx = col_idx.astype(np.int32)  # halves the transfer; csr_matrix stores int32 indices anyway
+    return prob_y, np.frombuffer(prob_x, dtype="d"), col_idx, np.frombuffer(row_nnz, dtype="l")
+
+
+def _read_libsvm_chunks(file_path: str):
+    """Parse a large file with worker processes. Returns None if the file should be read sequentially."""
+    size = os.path.getsize(file_path)
+    num_workers = min(8, psutil.cpu_count(logical=False) or 1)
+    # Text mode reads with the locale encoding. Chunks split after b"\n", which
+    # is never part of a multi-byte character in UTF-8.
+    encoding = "utf-8" if sys.flags.utf8_mode else locale.getpreferredencoding(False)
+    if (
+        size < _PARALLEL_READ_MIN_BYTES
+        or num_workers < 2
+        or "fork" not in multiprocessing.get_all_start_methods()
+        or codecs.lookup(encoding).name not in {"utf-8", "ascii"}
+    ):
+        return None
+
+    bounds = [0]
+    with open(file_path, "rb") as f:
+        while bounds[-1] < size:
+            f.seek(min(bounds[-1] + _READ_CHUNK_BYTES, size))
+            f.readline()
+            bounds.append(min(f.tell(), size))
+    tasks = [(file_path, start, stop, encoding) for start, stop in zip(bounds[:-1], bounds[1:])]
+
+    prob_y, prob_x, col_idx, row_nnz = [], [], [], []
+    with multiprocessing.get_context("fork").Pool(min(num_workers, len(tasks))) as pool:
+        for result in pool.imap(_parse_libsvm_chunk, tasks):
+            if len(result) == 2:
+                # Lines before this chunk are all valid, so their count numbers the error.
+                raise _SvmFormatError(*result).to_public(sum(len(n) for n in row_nnz), file_path)
+            prob_y.extend(result[0])
+            prob_x.append(result[1])
+            col_idx.append(result[2])
+            row_nnz.append(result[3])
+    return prob_y, np.concatenate(prob_x), np.concatenate(col_idx), np.concatenate(row_nnz)
+
+
+def _read_libsvm_format(file_path: str) -> dict[str, list[list[int]] | sparse.csr_matrix]:
+    """Read multi-label LIBSVM-format data.
+
+    Large files are parsed in parallel; the result is the same as a sequential read.
+
+    Args:
+        file_path (str): Path to file.
+
+    Returns:
+        tuple[list[list[int]], sparse.csr_matrix]: A tuple of labels and features.
+    """
+    parsed = _read_libsvm_chunks(file_path)
+    if parsed is None:
+        try:
+            prob_y, prob_x, col_idx, row_nnz = _parse_libsvm_lines(open(file_path))
+        except _SvmFormatError as error:
+            raise error.to_public(0, file_path)
+        prob_x = np.frombuffer(prob_x, dtype="d")
+        col_idx = np.frombuffer(col_idx, dtype="l")
+        row_nnz = np.frombuffer(row_nnz, dtype="l")
+    else:
+        prob_y, prob_x, col_idx, row_nnz = parsed
+
+    row_ptr = np.zeros(len(row_nnz) + 1, dtype="l")
+    np.cumsum(row_nnz, out=row_ptr[1:])
     prob_x = sparse.csr_matrix((prob_x, col_idx, row_ptr))
 
     return {"x": prob_x, "y": prob_y}

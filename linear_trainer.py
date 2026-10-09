@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from math import ceil
 
 import numpy as np
@@ -43,17 +44,25 @@ def linear_test(config, model, datasets, label_mapping):
     if isinstance(model, (TreeModel, EnsembleTreeModel)):
         predict_kwargs["beam_width"] = config.beam_width
 
-    for i in tqdm(range(ceil(num_instance / config.eval_batch_size))):
-        slice = np.s_[i * config.eval_batch_size : (i + 1) * config.eval_batch_size]
-        preds = model.predict_values(datasets["test"]["x"][slice], **predict_kwargs)
-        target = datasets["test"]["y"][slice].toarray()
-        metrics.update(preds, target)
-        if k > 0:
-            labels[slice], scores[slice] = linear.get_topk_labels(preds, label_mapping, config.save_k_predictions)
-        elif config.save_positive_predictions:
-            res = linear.get_positive_labels(preds, label_mapping)
-            labels.append(res[0])
-            scores.append(res[1])
+    # Update the metrics with one batch while predicting the next. Updates still
+    # run one at a time, in batch order.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="libmultilabel-metrics") as executor:
+        update = None
+        for i in tqdm(range(ceil(num_instance / config.eval_batch_size))):
+            slice = np.s_[i * config.eval_batch_size : (i + 1) * config.eval_batch_size]
+            preds = model.predict_values(datasets["test"]["x"][slice], **predict_kwargs)
+            target = datasets["test"]["y"][slice].toarray()
+            if update is not None:
+                update.result()
+            update = executor.submit(metrics.update, preds, target)
+            if k > 0:
+                labels[slice], scores[slice] = linear.get_topk_labels(preds, label_mapping, config.save_k_predictions)
+            elif config.save_positive_predictions:
+                res = linear.get_positive_labels(preds, label_mapping)
+                labels.append(res[0])
+                scores.append(res[1])
+        if update is not None:
+            update.result()
     metric_dict = metrics.compute()
     return metric_dict, labels, scores
 
