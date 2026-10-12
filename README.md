@@ -26,7 +26,8 @@ See the documentation here: https://www.csie.ntu.edu.tw/~cjlin/libmultilabel
 # Tree-model optimization report: Original → v1 → v2
 
 LibMultiLabel linear tree model (`--linear --linear_technique tree`), evaluated on
-EURLEX-4K, EURLEX-57K, AmazonCat-13K and LF-Amazon-131K (zero-shot splits).
+EURLEX-4K, EURLEX-57K, AmazonCat-13K, LF-Amazon-131K and LF-Wikipedia-500K
+(zero-shot splits).
 
 | Version | Directory |
 | --- | --- |
@@ -49,6 +50,8 @@ lifetime peak RSS. All runs use `-m 8`.
 | AmazonCat-13K peak | 20851.4 MiB | 18284.7 MiB | **8146.3 MiB** | −60.9% |
 | LF-Amazon-131K time | 9083.76 s | 6852.05 s | **2446.34 s** | −73.1% |
 | LF-Amazon-131K peak | 16870.0 MiB | 13223.8 MiB | **7719.3 MiB** | −54.2% |
+| LF-Wikipedia-500K time | — | — | **53029.34 s** | — |
+| LF-Wikipedia-500K peak | — | — | **171906.5 MiB** | — |
 
 On EURLEX-4K, EURLEX-57K and AmazonCat-13K, all 12 metrics (P/R/NDCG/PSP@1,3,5)
 agree with the original within ±0.10 percentage points for v1 and ±0.02 for v2.
@@ -60,6 +63,11 @@ This consistent shift is not random variation, and it does not come from v2,
 which matches v1. It is most likely due to v1 limiting k-means to 8 threads,
 whereas the original clustering library defaults to half the CPU count (48 here).
 That can change the label tree, which on LF-Amazon-131K has about 33,000 nodes.
+
+LF-Wikipedia-500K was run only with v2, so it has no original or v1
+comparison. Its test scores are P@1 68.46, P@3 48.90, P@5 37.99 and NDCG@5
+58.00. The run took 14.7 h: about 5 h building the tree and about 1.2 h
+training. Peak memory was 167.9 GiB, the largest of all datasets here.
 
 ## 2. Run settings: identical for all versions
 
